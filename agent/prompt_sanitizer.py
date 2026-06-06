@@ -22,6 +22,31 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Helper: detect function-call values (not real secrets)
+# ---------------------------------------------------------------------------
+_FUNCTION_CALL_RE = re.compile(
+    r"^(?:"
+    r"os\.environ\.get\s*\(.*?"
+    r"|os\.getenv\s*\(.*?"
+    r"|env\.get\s*\(.*?"
+    r"|getenv\s*\(.*?"
+    r"|getpass\s*\(.*?"
+    r"|environ\s*\[.*?"
+    r"|[a-zA-Z_]\w*\s*\.\s*get\s*\(.*?"
+    r"|[a-zA-Z_]\w*\s*\[['\"]\w+['\"]\]"
+    r"|[a-zA-Z_]\w*\s*\(\)"
+    r")\s*$"
+)
+
+
+def _is_function_call(value: str) -> bool:
+    """Check if a credential-field value looks like a function call or dict access,
+    not a literal secret value."""
+    stripped = value.strip().strip('"\'')
+    return bool(_FUNCTION_CALL_RE.search(stripped))
+
+
+# ---------------------------------------------------------------------------
 # Pattern definitions
 # ---------------------------------------------------------------------------
 
@@ -443,7 +468,9 @@ class PromptSanitizer:
         restored_output = sanitizer.restore_response(model_output)
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None,
+                 existing_vault: Optional[Dict[str, Dict[str, Any]]] = None,
+                 existing_reverse: Optional[Dict[str, str]] = None):
         self._config = {
             "enabled": True,
             "pii": True,
@@ -458,12 +485,25 @@ class PromptSanitizer:
         # Persistent vault — maps placeholder -> metadata dict.
         # Survives across API calls within a session for stable IDs.
         self._vault: Dict[str, Dict[str, Any]] = {}
-
-        # Reverse lookup: original_value -> placeholder (for stable ID dedup)
         self._reverse: Dict[str, str] = {}
 
-        # Process-wide counter (always increments, never resets within session)
+        # If existing vault data is provided, load it so placeholder IDs
+        # stay stable across re-sanitization passes (leak prevention).
+        if existing_vault:
+            self._vault.update(existing_vault)
+        if existing_reverse:
+            self._reverse.update(existing_reverse)
+
+        # Process-wide counter — start from max existing if vault has entries
         self._counter: int = 0
+        if self._vault:
+            max_seq = 0
+            for ph in self._vault:
+                # Extract sequence number from placeholders like [DOMAIN_xxx_5]
+                parts = ph.rstrip("]").split("_")
+                if len(parts) >= 2 and parts[-1].isdigit():
+                    max_seq = max(max_seq, int(parts[-1]))
+            self._counter = max_seq
 
         # Per-request redaction counts (reset each sanitize_text call)
         self._redaction_counts: Dict[str, int] = {}
@@ -849,9 +889,13 @@ class PromptSanitizer:
                 value = m.group(3)
                 # Skip already-masked values (***, [FILTERED], [REDACTED], etc.),
                 # existing placeholders from earlier sanitization steps
-                # ([API_KEY_1], [ENV_SECRET_2], …), and Python/JSON literal
-                # non-secrets (None, null, true, false)
+                # ([API_KEY_1], [ENV_SECRET_2], …), Python/JSON literal
+                # non-secrets (None, null, true, false), and function calls
+                # like os.environ.get() or env.get().
                 if re.match(r"^(\*{3,}|\[([A-Z_]+_\d+|FILTERED|REDACTED|HIDDEN)\]|\.{3,}|None|null|nil|true|false|undefined|nullptr)$", value, re.IGNORECASE):
+                    return m.group(0)
+                # Skip function-call values (os.environ.get, env.get, getenv, etc.)
+                if _is_function_call(value):
                     return m.group(0)
                 # Store only the value, replace just the value portion
                 # preserving all surrounding formatting (quotes, whitespace)
@@ -930,19 +974,26 @@ class PromptSanitizer:
 
         # Ethereum addresses — only run if text has 0x + 40 hex chars
         # The callback checks surrounding context so SHA1:/MD5:/git commit
-        # prefixes don't cause false positives on hash digests.
+        # prefixes, bracket keywords like [hash], and other hash-reference
+        # patterns don't cause false positives on hash digests.
         if re.search(r"\b0x[a-fA-F0-9]{40}\b", text):
-            _HASH_FP_PREFIXES = [
-                "sha1:", "sha256:", "sha512:", "md5:",
-                "git commit", "hash:", "checksum:",
+            _HASH_FP_KEYWORDS = [
+                "sha1", "sha256", "sha384", "sha512",
+                "sha-1", "sha-256", "sha-512",
+                "md2", "md4", "md5",
+                "git commit", "commit ",
+                "hash", "checksum",
+                "digest", "fingerprint", "hmac",
             ]
             _text_for_ctx = text  # capture for closure
-            def _eth_replace(m, _text=_text_for_ctx, _prefixes=_HASH_FP_PREFIXES, _self=self):
-                # Look back up to 30 chars before the match for hash keywords
-                ctx_start = max(0, m.start() - 30)
+            def _eth_replace(m, _text=_text_for_ctx, _keywords=_HASH_FP_KEYWORDS, _self=self):
+                # Look back up to 50 chars before the match for hash keywords
+                ctx_start = max(0, m.start() - 50)
                 prefix = _text[ctx_start:m.start()].lower()
-                if any(p in prefix for p in _prefixes):
-                    return m.group(0)  # Looks like a hash, not an ETH address
+                # Break prefix into words for word-boundary matching
+                for kw in _keywords:
+                    if kw in prefix:
+                        return m.group(0)  # Looks like a hash, not an ETH address
                 return _self._sanitize_match(m, "CRYPTO")
             text = _ETHEREUM_ADDR_RE.sub(_eth_replace, text)
 
@@ -962,9 +1013,23 @@ class PromptSanitizer:
         if "AccountKey" in text or "SharedAccessKey" in text:
             text = _AZURE_CONNSTR_RE.sub(lambda m: self._sanitize_match(m, "AZURE_KEY"), text)
 
-        # Discord webhook URLs
+        # Discord webhook URLs (with FP guard: error messages / docs / examples)
         if "discord" in text and "webhook" in text:
-            text = _DISCORD_WEBHOOK_RE.sub(lambda m: self._sanitize_match(m, "DISCORD_WEBHOOK"), text)
+            _DISCORD_FP_KEYWORDS = [
+                "invalid", "error", "example",
+                "webhook_url", "webhook_url=", "webhook url",
+                "// ", "# ", "//",
+            ]
+            _text_for_dc = text
+            def _discord_replace(m, _text=_text_for_dc, _fp_kw=_DISCORD_FP_KEYWORDS, _self=self):
+                # Check surrounding context (100 chars before match)
+                ctx_start = max(0, m.start() - 100)
+                ctx = _text[ctx_start:m.start()].lower()
+                # If context contains FP keywords, skip sanitization
+                if any(kw in ctx for kw in _fp_kw):
+                    return m.group(0)
+                return _self._sanitize_match(m, "DISCORD_WEBHOOK")
+            text = _DISCORD_WEBHOOK_RE.sub(_discord_replace, text)
 
         return text
 
@@ -1067,13 +1132,90 @@ class PromptSanitizer:
             from urllib.parse import urlparse
 
             _SAFE_URL_DOMAINS = frozenset({
+                # Example/test domains
                 "example.com", "example.org", "example.net",
                 "test.com", "test.org", "test.net",
+                # Social / messaging
+                "twitter.com", "x.com",
+                "reddit.com",
+                "linkedin.com",
+                "discord.com", "discord.gg",
+                "telegram.org", "t.me",
+                "whatsapp.com", "signal.org",
+                "slack.com",
+                "zoom.us",
+                #  Google and products
+                "google.com", "gmail.com", "googleapis.com",
+                "youtube.com", "youtu.be",
+                # Meta / social
+                "facebook.com", "instagram.com", "threads.net",
+                # Microsoft / GitHub
+                "github.com", "github.io",
+                "gitlab.com", "gitlab.io",
+                "bitbucket.org",
+                "microsoft.com", "azure.com",
+                # Apple
+                "apple.com", "icloud.com",
+                # AWS / Cloud
+                "amazon.com", "amazonaws.com",
+                "cloudflare.com",
+                "vercel.com", "netlify.com",
+                "heroku.com", "render.com", "fly.io",
+                "digitalocean.com", "linode.com", "ovh.com",
+                # SaaS / productivity
+                "atlassian.com", "jira.com",
+                "notion.com", "notion.so",
+                "figma.com", "canva.com",
+                "miro.com", "linear.app",
+                "asana.com", "trello.com",
+                "dropbox.com", "box.com",
+                "airtable.com",
+                # Payments
+                "stripe.com", "paypal.com", "square.com",
+                # Developer platforms
+                "stackoverflow.com", "stackexchange.com",
+                "medium.com", "dev.to", "hashnode.dev",
+                "wikipedia.org", "wikimedia.org",
+                "npmjs.com", "pypi.org",
+                "docker.com", "docker.io", "dockerhub.com",
+                "nuget.org", "crates.io", "rubygems.org",
+                "maven.org", "sonatype.com",
+                "replit.com", "glitch.com", "codepen.io",
+                "jsfiddle.net", "codesandbox.io", "stackblitz.com",
+                # Programming languages / frameworks
+                "python.org", "nodejs.org", "deno.land",
+                "rust-lang.org", "golang.org", "go.dev",
+                "typescriptlang.org", "react.dev", "nextjs.org",
+                "vuejs.org", "angular.io", "nuxtjs.org",
+                "svelte.dev", "tailwindcss.com",
+                "spring.io", "laravel.com", "djangoproject.com",
+                # Standards / docs
+                "mozilla.org", "developer.mozilla.org",
+                "w3.org", "whatwg.org",
+                "ietf.org", "rfc-editor.org",
+                # AI / ML
+                "pytorch.org", "tensorflow.org",
+                "keras.io", "jax.dev",
+                # Misc important
+                "news.ycombinator.com",
+                "producthunt.com",
+                "quora.com", "blogspot.com",
+                "wordpress.com", "ghost.org",
+                "substack.com",
+                "namecheap.com", "godaddy.com", "gandi.net",
+                "fastly.com", "akamai.com",
             })
 
-            def _url_hostname_replace(m):
+            def _url_hostname_replace(m, _full_text=text):
                 """Replace only the hostname in a matched URL."""
                 url = m.group(0)
+                # Skip URL redaction if context suggests FP (error/example/discord docs)
+                ctx_start = max(0, m.start() - 100)
+                ctx = _full_text[ctx_start:m.start()].lower()
+                _URL_FP_KEYWORDS = ["invalid", "webhook_url", "webhook url",
+                                    "example", "//", "# "]
+                if any(kw in ctx for kw in _URL_FP_KEYWORDS):
+                    return url
                 try:
                     parsed = urlparse(url)
                     hostname = parsed.hostname
@@ -1145,9 +1287,76 @@ class PromptSanitizer:
                 domain = m.group(0)
                 domain_lower = domain.lower()
 
-                # Never replace safe examples/test domains (including subdomains)
-                _SAFE_DOMAIN_TLDS = ("example.com", "example.org", "example.net",
-                                     "test.com", "test.org", "test.net")
+                # Never replace safe domains (including subdomains)
+                _SAFE_DOMAIN_TLDS = (
+                    # Example/test domains
+                    "example.com", "example.org", "example.net",
+                    "test.com", "test.org", "test.net",
+                    # Social / messaging
+                    "twitter.com", "x.com",
+                    "reddit.com", "linkedin.com",
+                    "discord.com", "discord.gg",
+                    "telegram.org", "t.me",
+                    "whatsapp.com", "signal.org",
+                    "slack.com", "zoom.us",
+                    #  Google and products
+                    "google.com", "gmail.com", "googleapis.com",
+                    "youtube.com", "youtu.be",
+                    # Meta / social
+                    "facebook.com", "instagram.com", "threads.net",
+                    # Microsoft / GitHub
+                    "github.com", "github.io",
+                    "gitlab.com", "gitlab.io", "bitbucket.org",
+                    "microsoft.com", "azure.com",
+                    # Apple
+                    "apple.com", "icloud.com",
+                    # AWS / Cloud
+                    "amazon.com", "amazonaws.com",
+                    "cloudflare.com", "fastly.com", "akamai.com",
+                    "vercel.com", "netlify.com", "render.com", "fly.io",
+                    "heroku.com", "digitalocean.com",
+                    "linode.com", "ovh.com",
+                    # SaaS / productivity
+                    "atlassian.com", "jira.com",
+                    "notion.com", "notion.so",
+                    "figma.com", "canva.com",
+                    "miro.com", "linear.app",
+                    "asana.com", "trello.com",
+                    "dropbox.com", "box.com", "airtable.com",
+                    # Payments
+                    "stripe.com", "paypal.com", "square.com",
+                    # Developer platforms
+                    "stackoverflow.com", "stackexchange.com",
+                    "medium.com", "dev.to", "hashnode.dev",
+                    "wikipedia.org", "wikimedia.org",
+                    "npmjs.com", "pypi.org",
+                    "docker.com", "docker.io", "dockerhub.com",
+                    "nuget.org", "crates.io", "rubygems.org",
+                    "maven.org", "sonatype.com",
+                    "replit.com", "glitch.com", "codepen.io",
+                    "jsfiddle.net", "codesandbox.io", "stackblitz.com",
+                    # AI / ML
+                    "huggingface.co",
+                    "openai.com", "anthropic.com",
+                    "pytorch.org", "tensorflow.org",
+                    "keras.io", "jax.dev",
+                    # Programming languages / frameworks
+                    "python.org", "nodejs.org", "deno.land",
+                    "rust-lang.org", "golang.org", "go.dev",
+                    "typescriptlang.org", "react.dev", "nextjs.org",
+                    "vuejs.org", "angular.io", "nuxtjs.org",
+                    "svelte.dev", "tailwindcss.com",
+                    "spring.io", "laravel.com", "djangoproject.com",
+                    # Standards / docs
+                    "mozilla.org", "developer.mozilla.org",
+                    "w3.org", "whatwg.org",
+                    "ietf.org", "rfc-editor.org",
+                    # Misc
+                    "news.ycombinator.com", "producthunt.com",
+                    "quora.com", "blogspot.com",
+                    "wordpress.com", "ghost.org", "substack.com",
+                    "namecheap.com", "godaddy.com", "gandi.net",
+                )
                 if any(domain_lower == safe or domain_lower.endswith("." + safe)
                        for safe in _SAFE_DOMAIN_TLDS):
                     return domain

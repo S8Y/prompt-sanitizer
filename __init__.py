@@ -40,8 +40,10 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import re
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -162,8 +164,14 @@ def _get_sanitizer():
     return None
 
 
-def _sanitize_messages(messages: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Sanitize *messages* in-place and return the placeholder->original vault.
+def _sanitize_messages(messages: List[Dict[str, Any]],
+                       existing_vault: Optional[Dict[str, Dict[str, Any]]] = None,
+                       existing_reverse: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Sanitize *messages* in-place and return the placeholder->metadata vault.
+
+    When *existing_vault* / *existing_reverse* are provided, placeholder IDs
+    from a previous pass are reused, keeping IDs stable across turns and
+    preventing duplicate placeholders for the same value.
 
     Returns an empty dict if sanitization is disabled or the sanitizer
     class is unavailable.
@@ -177,7 +185,8 @@ def _sanitize_messages(messages: List[Dict[str, Any]]) -> Dict[str, str]:
         logger.warning("PromptSanitizer class unavailable — skipping sanitization")
         return {}
 
-    sanitizer = SanitizerCls(config)
+    sanitizer = SanitizerCls(config, existing_vault=existing_vault,
+                             existing_reverse=existing_reverse)
     try:
         sanitizer.sanitize_messages(messages)
         vault = sanitizer.get_vault()
@@ -300,11 +309,31 @@ def _make_sanitized_wrapper(original_func):
         api_kwargs = args[0] if args else {}
 
         messages = api_kwargs.get("messages", [])
+
+        # Pass existing vault for stable placeholder IDs across turns.
+        # This prevents leak-through: conversation_history from previous
+        # turns is re-sanitized using the same IDs, so the LLM never
+        # receives real values and nested agents inherit sanitized context.
+        existing_vault_flat = _get_vault()
+        existing_vault = {}
+        existing_reverse = {}
+        if existing_vault_flat:
+            now = time.time()
+            for ph, val in existing_vault_flat.items():
+                existing_vault[ph] = {
+                    "value": val,
+                    "created_at": now,
+                    "last_used_at": now,
+                }
+                existing_reverse[val] = ph
+
         vault: Dict[str, str] = {}
 
         # --- Pre-call: sanitize messages in-place ---
         if messages and isinstance(messages, list):
-            vault = _sanitize_messages(messages)
+            vault = _sanitize_messages(messages,
+                                       existing_vault=existing_vault,
+                                       existing_reverse=existing_reverse)
             if vault:
                 _store_vault(vault)
 
@@ -470,6 +499,63 @@ def _on_session_end(**kwargs) -> None:
     _clear_vault()
 
 
+def _on_transform_tool_result(
+    result: str = "",
+    tool_name: str = "",
+    tool_call_id: str = "",
+    **kwargs,
+) -> Optional[str]:
+    """Re-sanitize tool output to prevent sensitive data leakage.
+
+    After a tool executes, its output may contain real values that were
+    restored for tool dispatch (e.g. the actual domain name, email, or
+    API key).  This hook re-sanitizes the result before it reaches the
+    model or is stored in conversation history, keeping placeholders
+    consistent across turns.
+    """
+    if not result:
+        return None
+
+    vault_flat = _get_vault()
+    if not vault_flat:
+        return None
+
+    # Convert flat vault to metadata dict and build reverse lookup
+    now = time.time()
+    existing_vault = {}
+    existing_reverse = {}
+    for ph, val in vault_flat.items():
+        existing_vault[ph] = {
+            "value": val,
+            "created_at": now,
+            "last_used_at": now,
+        }
+        existing_reverse[val] = ph
+
+    config = _get_config()
+    SanitizerCls = _get_sanitizer()
+    if SanitizerCls is None:
+        return None
+
+    sanitizer = SanitizerCls(config,
+                             existing_vault=existing_vault,
+                             existing_reverse=existing_reverse)
+    try:
+        sanitized = sanitizer.sanitize_text(result)
+        if sanitized != result:
+            logger.debug(
+                "Re-sanitized %d leaked value(s) in tool '%s' output",
+                len(sanitizer.get_vault()),
+                tool_name,
+            )
+            return sanitized
+    except Exception:
+        logger.debug("Tool output re-sanitization failed for '%s'", tool_name,
+                     exc_info=True)
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -490,6 +576,9 @@ def register(ctx) -> None:
     # 3. Register the pre-call hook so the LLM is informed about placeholders.
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
 
-    # 4. On session end, clear the vault to prevent cross-session leakage.
+    # 4. Re-sanitize tool output so leaked real values are re-placeholderized.
+    ctx.register_hook("transform_tool_result", _on_transform_tool_result)
+
+    # 5. On session end, clear the vault to prevent cross-session leakage.
     #    (Covers restart scenarios where the agent object is reused.)
     ctx.register_hook("on_session_end", _on_session_end)

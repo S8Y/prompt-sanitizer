@@ -311,7 +311,7 @@ TTL-based expiry (default 48h) cleans stale entries.
 ## False Positive Prevention
 
 Thoroughly tested against real-world error messages, stack traces, log
-output, and natural language to minimise false triggers during red teaming:
+output, and natural language to minimise false triggers:
 
 | Pattern | Prevention |
 |---------|-----------|

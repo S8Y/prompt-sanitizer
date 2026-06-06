@@ -1,4 +1,5 @@
 # prompt-guard
+<img width="953" height="209" alt="{24A976B1-5BDC-4964-BEC0-DFB491350133}" src="https://github.com/user-attachments/assets/0c706c90-5f65-4d4c-8019-32a42e24cc02" />
 
 **Prompt & Response Sanitization Layer for Sensitive Data Protection.**
 

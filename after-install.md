@@ -1,4 +1,4 @@
-# prompt-sanitizer — installed
+# prompt-guard — installed
 
 The prompt sanitization layer is now active.
 
@@ -37,7 +37,7 @@ Then restart Hermes.
 ## Confirm it's active
 
 ```bash
-hermes plugins list | grep prompt-sanitizer
+hermes plugins list | grep prompt-guard
 ```
 
 You should see it listed as **enabled**.
@@ -45,6 +45,6 @@ You should see it listed as **enabled**.
 ## Uninstall
 
 ```bash
-hermes plugins disable prompt-sanitizer
-hermes plugins remove prompt-sanitizer
+hermes plugins disable prompt-guard
+hermes plugins remove prompt-guard
 ```

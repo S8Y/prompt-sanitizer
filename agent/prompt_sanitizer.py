@@ -362,8 +362,10 @@ _CREDIT_CARD_RE = re.compile(
 )
 
 # Bitcoin addresses (legacy P2PKH/P2SH)
+# Requires at least one letter from the base58 alpha set in the match
+# body to avoid false positives on all-digit strings like "1111...".
 _BITCOIN_ADDR_RE = re.compile(
-    r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b"
+    r"\b[13](?=[a-km-zA-HJ-NP-Z1-9]{25,34}\b)[a-km-zA-HJ-NP-Z1-9]*[a-km-zA-HJ-NP-Z][a-km-zA-HJ-NP-Z1-9]*"
 )
 
 # Bitcoin addresses (Bech32)
@@ -918,8 +920,9 @@ class PromptSanitizer:
             text = _TELEGRAM_RE.sub(_telegram_replace, text)
 
         # Bitcoin addresses (legacy P2PKH/P2SH) — only run if text has a
-        # plausible Base58-encoded address (26-35 char word starting with 1 or 3)
-        if re.search(r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b", text):
+        # plausible Base58-encoded address (26-35 char word starting with 1 or 3
+        # containing at least one letter to avoid all-digit FPs)
+        if re.search(r"\b[13](?=[a-km-zA-HJ-NP-Z1-9]{25,34}\b)[a-km-zA-HJ-NP-Z1-9]*[a-km-zA-HJ-NP-Z][a-km-zA-HJ-NP-Z1-9]*", text):
             text = _BITCOIN_ADDR_RE.sub(lambda m: self._sanitize_match(m, "CRYPTO"), text)
         # Bitcoin Bech32 — only run if text has bc1 + 38+ lowercase-alphanumeric chars
         if re.search(r"\bbc1[a-z0-9]{38,}\b", text):

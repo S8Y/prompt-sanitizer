@@ -1,4 +1,4 @@
-"""prompt-sanitizer — Hermes plugin for sensitive data protection.
+"""prompt-guard — Hermes plugin for sensitive data protection.
 
 Before messages reach the LLM provider, this plugin detects and replaces
 sensitive patterns (API keys, emails, tokens, hostnames, DB URIs, etc.)
@@ -8,7 +8,7 @@ users can see what was protected.
 
 Activation is handled by the Hermes plugin system — standalone plugins only
 load when listed in ``plugins.enabled`` (via ``hermes plugins enable
-prompt-sanitizer`` or ``hermes tools → Prompt Sanitizer``).
+prompt-guard`` or ``hermes tools → Prompt Guard``).
 
 Configuration is read from ``config.yaml`` ``security.sanitization.*``::
 
@@ -476,7 +476,7 @@ def _on_session_end(**kwargs) -> None:
 
 
 def register(ctx) -> None:
-    """Register the prompt-sanitizer plugin.
+    """Register the prompt-guard plugin.
 
     Called once by the Hermes plugin system during startup.
     """

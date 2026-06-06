@@ -1,4 +1,4 @@
-name: prompt-sanitizer
+name: prompt-guard
 version: 1.1.0
 description: >
   Prompt & Response Sanitization Layer for Sensitive Data Protection.

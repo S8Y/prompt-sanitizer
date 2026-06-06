@@ -86,6 +86,7 @@ def _get_config() -> Dict[str, Any]:
         "pii": _read_bool_env("HERMES_SANITIZE_PII", "true"),
         "secrets": _read_bool_env("HERMES_SANITIZE_SECRETS", "true"),
         "infrastructure": _read_bool_env("HERMES_SANITIZE_INFRA", "true"),
+        "urls": _read_bool_env("HERMES_SANITIZE_URLS", "false"),
         "restore_responses": _read_bool_env("HERMES_SANITIZE_RESTORE", "true"),
     }
 
@@ -122,7 +123,7 @@ def _store_vault(entries: Dict[str, str]) -> None:
 def _get_sanitizer():
     """Import and return the PromptSanitizer class."""
     try:
-        from .prompt_sanitizer import PromptSanitizer
+        from agent.prompt_sanitizer import PromptSanitizer
         return PromptSanitizer
     except ImportError:
         return None
@@ -353,6 +354,67 @@ def _on_transform_llm_output(
     return restored
 
 
+def _on_pre_llm_call(
+    session_id: str = "",
+    user_message: str = "",
+    conversation_history: list = None,
+    is_first_turn: bool = False,
+    **kwargs,
+) -> Optional[Dict[str, str]]:
+    """Pre_llm_call hook — inject context explaining the placeholder system.
+
+    The LLM sees placeholders like ``[EMAIL_1]``, ``[API_KEY_1]``,
+    ``[URL_1]``, ``[DOMAIN_1]`` in prompts but has no way to know they
+    represent real values.  This context tells the LLM to treat them as
+    the original data, which is essential when the LLM needs to act on
+    those values (send an email, fetch a URL, call an API).
+
+    Injection happens on the first turn only to keep token overhead low.
+    """
+    config = _get_config()
+    if not config.get("enabled", False):
+        return None
+
+    # Inject only on first turn — the LLM maintains the understanding
+    # once it has seen the note.
+    if not is_first_turn:
+        return None
+
+    return {
+        "context": (
+            "[PRIVACY NOTICE] This conversation uses an automated prompt "
+            "sanitization layer that replaces sensitive data (API keys, "
+            "tokens, emails, phone numbers, URLs, hostnames, credentials, "
+            "and database URIs) with safe placeholders like ghp_abc123def456ghij789klm, "
+            "john@acme.org, [URL_1], [DOMAIN_1], environments.local, [CREDENTIAL_1], "
+            "and *** before sending prompts to the AI provider.\n\n"
+            "RULES:\n"
+            "1. TREAT placeholders as the real values. When you see "
+            "ghp_abc123def456ghij789klm, behave as if the original API key is there.\n"
+            "2. TOOL CALLS: You CAN safely use placeholders in tool call "
+            "arguments. The system automatically restores original values "
+            "before the tool is dispatched, so the tool receives real data "
+            "even though you wrote a placeholder.\n"
+            "3. FILE WRITES & EXPORTS: before writing or uploading any "
+            "file that contains placeholders, replace them with the real "
+            "values first. The [LOCK] markers in the conversation text "
+            "indicate values that have already been restored for your use.\n"
+            "4. STREAMING: placeholders are restored as they arrive in "
+            "streaming mode. Do not try to guess or reconstruct the "
+            "original values — they are restored automatically.\n"
+            "5. NEVER attempt to reconstruct, guess, or reverse-engineer "
+            "the original value from a placeholder. If you need the real "
+            "value for a tool call, just use the placeholder — the system "
+            "handles the rest."
+        )
+    }
+
+
+def _on_session_end(**kwargs) -> None:
+    """Clear the sanitization vault when the session ends."""
+    _clear_vault()
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -370,11 +432,9 @@ def register(ctx) -> None:
     # 2. Register the transform hook for the display-text layer.
     ctx.register_hook("transform_llm_output", _on_transform_llm_output)
 
-    # 3. On session end, clear the vault to prevent cross-session leakage.
+    # 3. Register the pre-call hook so the LLM is informed about placeholders.
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+
+    # 4. On session end, clear the vault to prevent cross-session leakage.
     #    (Covers restart scenarios where the agent object is reused.)
     ctx.register_hook("on_session_end", _on_session_end)
-
-
-def _on_session_end(**kwargs) -> None:
-    """Clear the sanitization vault when the session ends."""
-    _clear_vault()

@@ -8,5 +8,6 @@ description: >
   protected.  Configurable via security.sanitization.* in config.yaml.
 author: NousResearch
 hooks:
+  - pre_llm_call
   - transform_llm_output
   - on_session_end

@@ -1,0 +1,12 @@
+name: prompt-sanitizer
+version: 1.0.0
+description: >
+  Prompt & Response Sanitization Layer for Sensitive Data Protection.
+  Detects and replaces API keys, emails, tokens, hostnames, DB URIs, and other
+  sensitive patterns before they reach LLM providers.  Restores original values
+  in the model response with a visible 🔒 lock marker so users know what was
+  protected.  Configurable via security.sanitization.* in config.yaml.
+author: NousResearch
+hooks:
+  - transform_llm_output
+  - on_session_end

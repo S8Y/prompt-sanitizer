@@ -1,5 +1,5 @@
 name: prompt-sanitizer
-version: 1.0.0
+version: 1.0.1
 description: >
   Prompt & Response Sanitization Layer for Sensitive Data Protection.
   Detects and replaces API keys, emails, tokens, hostnames, DB URIs, and other

@@ -407,6 +407,35 @@ MIT
 
 ---
 
+## Changelog
+
+### v1.0.1 (2026-06-06)
+
+**Bug fixes:**
+- **Import resolution**: Fixed `_get_sanitizer()` to use `importlib` fallback when plugin 
+  directory is not on `sys.path` (fixes `PromptSanitizer class unavailable` warning)
+- **Vault value integrity**: `_env_replace`, `_json_replace`, `_auth_replace`, 
+  `_telegram_replace`, and `_cred_replace` now store only the sensitive value 
+  (not full context like `OPENAI_API_KEY=*** in vault — fixing round-trip restoration
+- **Placeholder nesting prevention**: ENV, JSON, AUTH, and CRED_FIELD patterns now 
+  skip values that are already sanitizer placeholders (`[API_KEY_1]`, etc.), 
+  preventing cascading placeholder chains
+- **Safe domain handling**: `_domain_replace` now correctly skips subdomains of 
+  safe domains (e.g., `ftp.example.com`); URL handler no longer inserts zero-width 
+  spaces into safe domain URLs
+- **Email safe domains**: Emails at safe domains (e.g., `anonymous@example.com`) 
+  now correctly pass through when `urls=true`
+
+**New:**
+- `tests/test_urls.py` — 31 tests covering URL detection, domain-only redaction, 
+  safe domains, false positives, round-trip restoration, and stable IDs
+
+### v1.0.0
+
+- Initial release
+
+---
+
 ## Authors
 
 Nous Research — Hermes Agent team.

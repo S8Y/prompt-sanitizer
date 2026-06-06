@@ -32,7 +32,9 @@ Tool uses:   real values (auto-restored before dispatch)
 - **Infrastructure detection** — private/internal IPs, internal hostnames
   (`*.internal`, `*.local`, `*.corp`), AWS ARNs, cloud metadata endpoints
 - **URL/hostname detection** — full URLs and 3+ label domain names
-  (opt-in; enable for red/blue team lockdown)
+  (opt-in; enable for red/blue team lockdown). **Validated against 1437 official
+  IANA TLDs** — hosts with non-existent TLDs (`.homeassistant`, `.corpnet`,
+  `.notatld`) are never redacted, preventing false positives.
 - **Response restoration** — original values restored with 🔒 markers so users
   see what was protected
 - **Tool call restoration** — tool call arguments auto-restored before dispatch;
@@ -82,7 +84,7 @@ Placeholders follow `[CATEGORY_N]` with session-stable IDs:
 | API_KEY | `[API_KEY_N]` | OpenAI, AWS, GitHub, Stripe, Slack... |
 | EMAIL | `[EMAIL_N]` | Email addresses |
 | PHONE | `[PHONE_N]` | International phone numbers |
-| URL | `[URL_N]` | HTTP/HTTPS URLs (opt-in) |
+|| URL | `[URL_N]` | HTTP/HTTPS URLs (opt-in, **domain-only redaction**) |
 | DOMAIN | `[DOMAIN_N]` | FQDNs 3+ labels (opt-in) |
 | IP | `[IP_N]` | Private/internal IPs |
 | HOST | `[HOST_N]` | *.internal, *.local, *.corp |
@@ -187,7 +189,8 @@ security:
 ```
 
 With lockdown:
-- Target hostnames/URLs → `[DOMAIN_N]` / `[URL_N]`
+- Target hostnames/URLs → `[DOMAIN_N]` **(only registered domain+TLD redacted;
+  subdomain, path, query, fragment preserved)**
 - Credentials → `[CREDENTIAL_N]`
 - IPs → `[IP_N]`
 - LLM sees only placeholders and must use tools to act
@@ -347,6 +350,10 @@ TTL-based expiry (default 48h) cleans stale entries.
   cryptographic UUIDs. An observer learns nothing about the original value.
 - **URL sanitization is opt-in**: protects target hosts from provider logging
   but may cause false positives on legitimate URLs.
+- **TLD-validated URL detection**: only domains with IANA-recognized TLDs are
+  redacted. Non-existent TLDs pass through unchanged.
+- **Safe-list domains are protected**: `example.com`, `test.com` and their
+  subdomains (`api.test.com`) are never redacted, even inside URLs.
 - **Credentials in URLs are always redacted**: `scheme://user:pass@host`
   regardless of URL toggle.
 - **Tool call args restored before dispatch**: no tool receives a placeholder.

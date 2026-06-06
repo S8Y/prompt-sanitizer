@@ -205,8 +205,10 @@ def _restore_text(text: str, vault: Dict[str, str], lock_emoji: bool = True) -> 
     """Restore placeholders in *text* using *vault*.
 
     When *lock_emoji* is True (default for content text), each restored
-    value uses ``[PLACEHOLDER]→value🔒`` format so users can see both
-    the redacted placeholder and the restored original value.
+    value uses ``[PLACEHOLDER]→value🔓`` format so users can see both
+    the redacted placeholder and the restored original value — the
+    ``🔓`` (unlock) emoji signals the value has been unredacted and
+    can be used freely.
     Set to False for tool call arguments (must remain valid JSON).
     """
     if not text or not vault:
@@ -217,7 +219,7 @@ def _restore_text(text: str, vault: Dict[str, str], lock_emoji: bool = True) -> 
     for ph in placeholders:
         original = vault[ph]
         if lock_emoji:
-            text = text.replace(ph, f"{ph}→{original}\U0001f512")
+            text = text.replace(ph, f"{ph}→{original}\U0001f513")
         else:
             text = text.replace(ph, original)
     return text
@@ -392,7 +394,7 @@ def _on_transform_llm_output(
     session_id: str = "",
     **kwargs,
 ) -> Optional[str]:
-    """transform_llm_output hook — add 🔒 markers and catch any stragglers.
+    """transform_llm_output hook — add 🔓 markers and catch any stragglers.
 
     The API-call wrapper already restores values in the raw response, but this
     hook fires on the final assembled response text and serves two purposes:
@@ -401,7 +403,8 @@ def _on_transform_llm_output(
        survived the API-level restoration (e.g. from providers with unusual
        response shapes, or from the streaming path where content is
        reassembled after our wrapper).
-    2. **🔒 markers**: ensure every restored value carries the lock emoji.
+    2. **🔓 markers**: ensure every restored value carries the unlock emoji
+       so users can see what was redacted and can freely use the originals.
     """
     if not response_text:
         return None
@@ -432,64 +435,54 @@ def _on_pre_llm_call(
     the original data, which is essential when the LLM needs to act on
     those values (send an email, fetch a URL, call an API).
 
-    Injection happens on the first turn only to keep token overhead low.
+    On the first turn of a session we inject a detailed explanation.
+    On subsequent turns we inject a compact reminder to keep token
+    overhead low while preventing the LLM from forgetting about
+    placeholders in long conversations.
     """
     config = _get_config()
     if not config.get("enabled", False):
         return None
 
-    # Inject only on first turn — the LLM maintains the understanding
-    # once it has seen the note.
-    if not is_first_turn:
-        return None
+    if is_first_turn:
+        return {
+            "context": (
+                "[PRIVACY NOTICE] A prompt sanitization layer is active. "
+                "Sensitive data (API keys, tokens, emails, phone numbers, URLs, "
+                "hostnames, credentials, SSNs, credit card numbers, private IPs) "
+                "is replaced with placeholders like [EMAIL_1], [DOMAIN_d7e3_5], "
+                "[API_KEY_3] before messages reach me.\n\n"
+                "PLACEHOLDER RULES:\n"
+                "1. Treat placeholders as the real data. [EMAIL_1] IS the email. "
+                "[DOMAIN_d7e3_5] IS the hostname.\n"
+                "2. Use placeholders directly in tool calls — the system restores "
+                "real values before dispatch. No extra action needed.\n"
+                "3. [FILE WRITES] Before writing/sending any file that contains "
+                "placeholders, manually restore them to real values first.\n"
+                "4. Never guess or reconstruct original values from placeholders.\n\n"
+                "UNREDACT ON DEMAND:\n"
+                "- The restored text you see uses [PLACEHOLDER]→value🔓 format.\n"
+                "- The 🔓 (unlock) means the value WAS redacted but HAS BEEN "
+                "restored — you can use the real value freely.\n"
+                "- In tool call arguments, placeholders are auto-restored before "
+                "dispatch — the tool gets real data even though you see the placeholder.\n"
+                "- The HUMAN USER can request all original values be shown by "
+                "asking e.g. \"show me the actual values\" — the system will unredact "
+                "and display them with clear 🔓 indicators."
+            )
+        }
 
+    # Compact reminder on every subsequent turn — keeps placeholder awareness
+    # alive even in long conversations where system prompt context is rotated.
+    vault = _get_vault()
+    if not vault:
+        return None
+    count = len(vault)
     return {
         "context": (
-            "[PRIVACY NOTICE] A prompt sanitization layer is active in this "
-            "session. It replaces sensitive data (API keys, tokens, emails, "
-            "phone numbers, URLs, hostnames, credentials, database URIs, "
-            "SSNs, credit card numbers, and private IPs) with structured "
-            "placeholders like [API_KEY_1], [EMAIL_3], [DOMAIN_a3f8b2c1_7], "
-            "[CREDENTIAL_2], [IP_4] before messages reach the provider. "
-            "These placeholders are safe to use for reasoning and tool calls.\n\n"
-            "PLACEHOLDER FORMAT:\n"
-            "- Most placeholders follow [CATEGORY_N] — e.g. [API_KEY_1], "
-            "[EMAIL_3], [IP_4]\n"
-            "- URL/DOMAIN placeholders include a short hash of the domain "
-            "name: [DOMAIN_a3f8b2c1_N]. Placeholders sharing the same hash "
-            "prefix (e.g. [DOMAIN_d7e3_1] and [DOMAIN_d7e3_2]) represent "
-            "the same registrant on different TLDs — they are likely related "
-            "domains.\n"
-            "- For URLs: only the registered domain + TLD is replaced with "
-            "a [DOMAIN_hash_N] placeholder. Subdomains, path, query, and "
-            "fragment remain visible.\n\n"
-            "RULES:\n"
-            "1. [PLACEHOLDERS ARE THE DATA] — Treat every placeholder as if "
-            "the original value is there. [DOMAIN_a3f8b2c1_5] IS the target "
-            "hostname. [EMAIL_3] IS the real email address. Reason with "
-            "them directly.\n\n"
-            "2. [TOOL CALLS] — You CAN use placeholders in tool call "
-            "arguments. The system automatically restores original values "
-            "before dispatch. The tool receives real data even though you "
-            "wrote [DOMAIN_a3f8b2c1_5] or [API_KEY_1] in the argument. "
-            "No extra action needed from you.\n\n"
-            "3. [🔒 IS DECORATIVE] — After a response is generated, restored "
-            "values in displayed text use [PLACEHOLDER]→value🔒 format "
-            "so users can see both the redacted form and the original. "
-            "This arrow+emoji markup is NEVER present in tool call "
-            "arguments, file content, or API calls. It is purely visual "
-            "and has no effect on code, tools, or execution.\n\n"
-            "4. [FILE WRITES & EXPORTS] — Before writing or uploading any "
-            "file that contains placeholders, manually restore them to real "
-            "values first. The auto-restore system only covers tool dispatch "
-            "and conversation display — it does NOT patch files on disk.\n\n"
-            "5. [NEVER GUESS] — Do not attempt to reconstruct, guess, or "
-            "reverse-engineer the original value from a placeholder. If you "
-            "need the real value for a tool call, just use the placeholder "
-            "as-is — the system handles restoration.\n\n"
-            "6. [STREAMING] — Placeholders are restored as they arrive in "
-            "streaming mode. You will never see a raw [CATEGORY_N] in the "
-            "final output."
+            f"[REMINDER] {count} placeholder(s) active — use them directly in "
+            f"tool calls, the system auto-restores real values before dispatch. "
+            f"No need to guess or reconstruct. 🔓 values in output are restored originals."
         )
     }
 

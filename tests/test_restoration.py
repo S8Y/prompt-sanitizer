@@ -33,7 +33,7 @@ s1 = PromptSanitizer({"enabled":True,"pii":True,"secrets":True,"infrastructure":
 txt1 = "Card: 4111-1111-1111-1111, SSN: 123-45-6789"
 san1 = s1.sanitize_text(txt1)
 v1 = s1.get_vault()
-rest1 = s1.restore_text(san1)
+rest1 = s1.restore_text(san1, lock_emoji=False)
 check("vault non-empty", len(v1) >= 2, "vault: %s" % list(v1.keys()))
 check("round-trip", rest1 == txt1, "san=%s rest=%s" % (trunc(san1), trunc(rest1)))
 
@@ -47,7 +47,7 @@ for t in [
 ]:
     s = PromptSanitizer({"enabled":True,"pii":True,"secrets":True,"infrastructure":True})
     san = s.sanitize_text(t)
-    rest = s.restore_text(san)
+    rest = s.restore_text(san, lock_emoji=False)
     check("trip %s" % trunc(t, 35), rest == t,
           "san=%s rest=%s" % (trunc(san), trunc(rest)))
 
@@ -58,7 +58,7 @@ s3.sanitize_text("password=hunter2")
 v3 = s3.get_vault()
 ph = [k for k in v3 if k.startswith("[CREDENTIAL_")][0]
 tc = '{"pwd": "' + ph + '", "op": "auth"}'
-rest = s3.restore_text(tc)
+rest = s3.restore_text(tc, lock_emoji=False)
 check("toolcall restored", "hunter2" in rest, "ph=%s rest=%s" % (ph, trunc(rest, 60)))
 
 # --- Test 4: Word-aligned streaming ---
@@ -67,7 +67,7 @@ s4 = PromptSanitizer({"enabled":True,"pii":True,"secrets":True,"infrastructure":
 orig4 = "SSN: 123-45-6789 and Card: 4111-1111-1111-1111"
 san4 = s4.sanitize_text(orig4)
 words = san4.split(" ")
-restored_words = [s4.restore_text(w) for w in words]
+restored_words = [s4.restore_text(w, lock_emoji=False) for w in words]
 full = " ".join(restored_words)
 check("streaming round-trip", full == orig4,
       "orig=%s full=%s" % (trunc(orig4, 60), trunc(full, 60)))
@@ -121,7 +121,7 @@ txt9 = "SSN: 987-65-4321, Card: 4111-1111-1111-1111, Password: p@ssw0rd_s3cr3t"
 san9 = s9.sanitize_text(txt9)
 v9 = s9.get_vault()
 check("long txt ph", len(v9) >= 2, "Only %d: %s" % (len(v9), list(v9.keys())))
-rest9 = s9.restore_text(san9)
+rest9 = s9.restore_text(san9, lock_emoji=False)
 check("long txt round-trip", rest9 == txt9,
       "orig=%s rest=%s" % (trunc(txt9, 50), trunc(rest9, 50)))
 
@@ -150,7 +150,7 @@ print("\n--- Phone ---")
 s13 = PromptSanitizer({"enabled":True,"pii":True,"secrets":True,"infrastructure":True})
 txt13 = "Call me at +1 (555) 123-4567"
 san13 = s13.sanitize_text(txt13)
-rest13 = s13.restore_text(san13)
+rest13 = s13.restore_text(san13, lock_emoji=False)
 check("phone round-trip", rest13 == txt13, "rest=%s" % trunc(rest13))
 
 # --- Test 14: Credential field with semicolon ---
@@ -160,7 +160,7 @@ txt14 = "password=hunter2;api_key=sk-abc...mnop"
 san14 = s14.sanitize_text(txt14)
 v14 = s14.get_vault()
 check("cred detected", "hunter2" in str(v14), "vault: %s" % list(v14.keys()))
-rest14 = s14.restore_text(san14)
+rest14 = s14.restore_text(san14, lock_emoji=False)
 check("cred round-trip", rest14 == txt14, "rest=%s" % trunc(rest14))
 
 # --- Test 15: Mangled email not flagged ---

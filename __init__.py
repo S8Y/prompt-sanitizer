@@ -87,7 +87,7 @@ def _get_config() -> Dict[str, Any]:
         "pii": _read_bool_env("HERMES_SANITIZE_PII", "true"),
         "secrets": _read_bool_env("HERMES_SANITIZE_SECRETS", "true"),
         "infrastructure": _read_bool_env("HERMES_SANITIZE_INFRA", "true"),
-        "urls": _read_bool_env("HERMES_SANITIZE_URLS", "false"),
+        "urls": _read_bool_env("HERMES_SANITIZE_URLS", "true"),
         "restore_responses": _read_bool_env("HERMES_SANITIZE_RESTORE", "true"),
     }
 
@@ -196,7 +196,8 @@ def _restore_text(text: str, vault: Dict[str, str], lock_emoji: bool = True) -> 
     """Restore placeholders in *text* using *vault*.
 
     When *lock_emoji* is True (default for content text), each restored
-    value has ``🔒`` appended so users can see what was protected.
+    value uses ``[PLACEHOLDER]→value🔒`` format so users can see both
+    the redacted placeholder and the restored original value.
     Set to False for tool call arguments (must remain valid JSON).
     """
     if not text or not vault:
@@ -207,7 +208,7 @@ def _restore_text(text: str, vault: Dict[str, str], lock_emoji: bool = True) -> 
     for ph in placeholders:
         original = vault[ph]
         if lock_emoji:
-            text = text.replace(ph, original + "🔒")
+            text = text.replace(ph, f"{ph}→{original}\U0001f512")
         else:
             text = text.replace(ph, original)
     return text
@@ -419,29 +420,36 @@ def _on_pre_llm_call(
             "session. It replaces sensitive data (API keys, tokens, emails, "
             "phone numbers, URLs, hostnames, credentials, database URIs, "
             "SSNs, credit card numbers, and private IPs) with structured "
-            "placeholders like [API_KEY_1], [EMAIL_3], [DOMAIN_7], "
+            "placeholders like [API_KEY_1], [EMAIL_3], [DOMAIN_a3f8b2c1_7], "
             "[CREDENTIAL_2], [IP_4] before messages reach the provider. "
             "These placeholders are safe to use for reasoning and tool calls.\n\n"
             "PLACEHOLDER FORMAT:\n"
-            "- All placeholders follow [CATEGORY_N] — e.g. [API_KEY_1], "
-            "[EMAIL_3], [DOMAIN_7], [IP_4]\n"
+            "- Most placeholders follow [CATEGORY_N] — e.g. [API_KEY_1], "
+            "[EMAIL_3], [IP_4]\n"
+            "- URL/DOMAIN placeholders include a short hash of the domain "
+            "name: [DOMAIN_a3f8b2c1_N]. Placeholders sharing the same hash "
+            "prefix (e.g. [DOMAIN_d7e3_1] and [DOMAIN_d7e3_2]) represent "
+            "the same registrant on different TLDs — they are likely related "
+            "domains.\n"
             "- For URLs: only the registered domain + TLD is replaced with "
-            "[DOMAIN_N]. Subdomains, path, query, and fragment remain "
-            "visible.\n\n"
+            "a [DOMAIN_hash_N] placeholder. Subdomains, path, query, and "
+            "fragment remain visible.\n\n"
             "RULES:\n"
             "1. [PLACEHOLDERS ARE THE DATA] — Treat every placeholder as if "
-            "the original value is there. [DOMAIN_5] IS the target hostname. "
-            "[EMAIL_3] IS the real email address. Reason with them directly.\n\n"
+            "the original value is there. [DOMAIN_a3f8b2c1_5] IS the target "
+            "hostname. [EMAIL_3] IS the real email address. Reason with "
+            "them directly.\n\n"
             "2. [TOOL CALLS] — You CAN use placeholders in tool call "
             "arguments. The system automatically restores original values "
             "before dispatch. The tool receives real data even though you "
-            "wrote [DOMAIN_5] or [API_KEY_1] in the argument. No extra "
-            "action needed from you.\n\n"
+            "wrote [DOMAIN_a3f8b2c1_5] or [API_KEY_1] in the argument. "
+            "No extra action needed from you.\n\n"
             "3. [🔒 IS DECORATIVE] — After a response is generated, restored "
-            "values in displayed text get a 🔒 suffix so users can see what "
-            "was protected (e.g. victim.com🔒). This emoji is NEVER present "
-            "in tool call arguments, file content, or API calls. It is purely "
-            "visual and has no effect on code, tools, or execution.\n\n"
+            "values in displayed text use [PLACEHOLDER]→value🔒 format "
+            "so users can see both the redacted form and the original. "
+            "This arrow+emoji markup is NEVER present in tool call "
+            "arguments, file content, or API calls. It is purely visual "
+            "and has no effect on code, tools, or execution.\n\n"
             "4. [FILE WRITES & EXPORTS] — Before writing or uploading any "
             "file that contains placeholders, manually restore them to real "
             "values first. The auto-restore system only covers tool dispatch "

@@ -9,9 +9,13 @@ in-memory vault, and restores original values in the model's response.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
+import os
 import re
+import secrets
 import time
 from typing import Any, Dict, List, Optional
 
@@ -78,7 +82,6 @@ _API_KEY_PREFIXES = [
     r"api-[a-f0-9]{32,}",                   # Algolia API key
     r"sk\.[A-Za-z0-9]{10,}",                # Clerk secret key
     r"FIREBASE_[A-Za-z0-9]{10,}",           # Firebase config key
-    r"eyJh[A-Za-z0-9_-]{10,}",              # Additional JWT header pattern
     r"pat_[A-Za-z0-9]{10,}",                # Generic Personal Access Token
 ]
 
@@ -87,9 +90,12 @@ _API_KEY_RE = re.compile(
 )
 
 # JWT tokens: header.payload.signature
+# Real JWTs are long Base64URL strings with 2-3 dot-separated segments.
+# Header alone is typically 30+ chars; requiring at least one dot-segment
+# (header.payload minimum) eliminates false positives on short eyJ prefixes.
 _JWT_RE = re.compile(
-    r"eyJ[A-Za-z0-9_-]{10,}"
-    r"(?:\.[A-Za-z0-9_=-]{4,}){0,2}"
+    r"eyJ[A-Za-z0-9_-]{25,}"
+    r"(?:\.[A-Za-z0-9_=-]{10,}){1,2}"
 )
 
 # Private key blocks (PEM format)
@@ -314,6 +320,37 @@ def _valid_tld(tld: str) -> bool:
     return tld.lower() in _TLDS
 
 
+# Per-session HMAC key for SLD hashing.  A new random key is generated
+# once per process so the same second-level domain produces a consistent
+# hash this session, but the hash cannot be reversed to the original
+# value without the key (which is never persisted or exposed).
+_SLD_HMAC_KEY: bytes = b""  # lazy-initialised on first use
+
+
+def _get_sld_hmac_key() -> bytes:
+    """Return (or generate) the per-process SLD HMAC key."""
+    global _SLD_HMAC_KEY
+    if not _SLD_HMAC_KEY:
+        _SLD_HMAC_KEY = secrets.token_bytes(32)
+    return _SLD_HMAC_KEY
+
+
+def _sld_hash(hostname: str) -> str:
+    """Return a short, non-reversible hash of the second-level domain.
+
+    Splits ``hostname`` at the last dot to separate SLD from TLD,
+    then computes ``HMAC-SHA256(sld_lower, per_session_key)[:8]``.
+    Identical SLDs (e.g. ``evil`` in ``evil.com`` / ``evil.io``)
+    produce the same hash so the LLM can recognise related domains,
+    but the hash cannot be reversed without the per-process key.
+    """
+    hostname_lower = hostname.lower()
+    last_dot = hostname_lower.rfind(".")
+    sld = hostname_lower[:last_dot] if last_dot != -1 else hostname_lower
+    key = _get_sld_hmac_key()
+    return hmac.new(key, sld.encode(), hashlib.sha256).hexdigest()[:8]
+
+
 # ---------------------------------------------------------------------------
 _SSN_RE = re.compile(
     r"\b\d{3}-\d{2}-\d{4}\b"
@@ -335,6 +372,9 @@ _BITCOIN_BECH32_RE = re.compile(
 )
 
 # Ethereum addresses (0x + 40 hex chars)
+# Uses a callback-based approach: the _eth_replace closure checks
+# surrounding context (e.g. SHA1:, MD5:, git commit) to avoid FPs
+# on hash digests in log output that happen to match 0x+40hex.
 _ETHEREUM_ADDR_RE = re.compile(
     r"\b0x[a-fA-F0-9]{40}\b"
 )
@@ -407,7 +447,7 @@ class PromptSanitizer:
             "pii": True,
             "secrets": True,
             "infrastructure": False,  # OFF by default — hostnames useful for LLM
-            "urls": False,
+            "urls": True,             # ON by default — domain redaction with hash IDs
             "restore_responses": True,
             "ttl_seconds": 172800,  # 48 hours
             **(config or {}),
@@ -592,7 +632,10 @@ class PromptSanitizer:
 
         Args:
             text: The text to restore.
-            lock_emoji: If True, appends ``\U0001f512`` (🔒) to each restored value.
+            lock_emoji: If True, uses ``[PLACEHOLDER]→value🔒`` format so
+                users can see both the redacted placeholder **and** the
+                restored original value.  If False (tool call args),
+                restores the bare value with no marker.
 
         Returns:
             Restored text with original values.
@@ -606,9 +649,13 @@ class PromptSanitizer:
         placeholders = sorted(vault.keys(), key=len, reverse=True)
         for placeholder in placeholders:
             original = vault[placeholder]
-            text = text.replace(
-                placeholder, original + ("\U0001f512" if lock_emoji else "")
-            )
+            if lock_emoji:
+                # Show both the placeholder that was used AND the restored value
+                text = text.replace(
+                    placeholder, f"{placeholder}→{original}\U0001f512"
+                )
+            else:
+                text = text.replace(placeholder, original)
 
         return text
 
@@ -870,15 +917,31 @@ class PromptSanitizer:
                 return f"{bot_prefix}{digits}:{placeholder}"
             text = _TELEGRAM_RE.sub(_telegram_replace, text)
 
-        # Bitcoin addresses (legacy P2PKH/P2SH)
-        if "1" in text or "3" in text:
+        # Bitcoin addresses (legacy P2PKH/P2SH) — only run if text has a
+        # plausible Base58-encoded address (26-35 char word starting with 1 or 3)
+        if re.search(r"\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b", text):
             text = _BITCOIN_ADDR_RE.sub(lambda m: self._sanitize_match(m, "CRYPTO"), text)
-        if "bc1" in text:
+        # Bitcoin Bech32 — only run if text has bc1 + 38+ lowercase-alphanumeric chars
+        if re.search(r"\bbc1[a-z0-9]{38,}\b", text):
             text = _BITCOIN_BECH32_RE.sub(lambda m: self._sanitize_match(m, "CRYPTO"), text)
 
-        # Ethereum addresses
-        if "0x" in text:
-            text = _ETHEREUM_ADDR_RE.sub(lambda m: self._sanitize_match(m, "CRYPTO"), text)
+        # Ethereum addresses — only run if text has 0x + 40 hex chars
+        # The callback checks surrounding context so SHA1:/MD5:/git commit
+        # prefixes don't cause false positives on hash digests.
+        if re.search(r"\b0x[a-fA-F0-9]{40}\b", text):
+            _HASH_FP_PREFIXES = [
+                "sha1:", "sha256:", "sha512:", "md5:",
+                "git commit", "hash:", "checksum:",
+            ]
+            _text_for_ctx = text  # capture for closure
+            def _eth_replace(m, _text=_text_for_ctx, _prefixes=_HASH_FP_PREFIXES, _self=self):
+                # Look back up to 30 chars before the match for hash keywords
+                ctx_start = max(0, m.start() - 30)
+                prefix = _text[ctx_start:m.start()].lower()
+                if any(p in prefix for p in _prefixes):
+                    return m.group(0)  # Looks like a hash, not an ETH address
+                return _self._sanitize_match(m, "CRYPTO")
+            text = _ETHEREUM_ADDR_RE.sub(_eth_replace, text)
 
         # OAuth tokens (Google ya29)
         if "ya29" in text:
@@ -964,7 +1027,7 @@ class PromptSanitizer:
         return text
 
     def _sanitize_urls(self, text: str) -> str:
-        """Sanitize URLs and domain names (OFF by default, opt-in via config).
+        """Sanitize URLs and domain names with hash-based placeholders.
 
         Runs last so internal hosts, IPs, emails, and credentials are
         already handled.  Only catches what wasn't caught by more specific
@@ -977,16 +1040,24 @@ class PromptSanitizer:
         enumeration.
 
             Ex: ``https://api.target.com/v1/users?page=1``
-            →   ``https://[DOMAIN_1]/v1/users?page=1``
+            →   ``https://[DOMAIN_a3f8b2c1_1]/v1/users?page=1``
 
-        **Standalone domain handling** — bare FQDNs (3+ labels like
-        ``foo.bar.com``) are replaced with ``[DOMAIN_N]`` as before.
+        **Hash-based placeholders** — each placeholder includes a short
+        HMAC-SHA256 hash of the second-level domain (SLD).  Identical
+        SLDs with different TLDs (e.g. ``evil.com`` and ``evil.io``)
+        share the same hash prefix, allowing the LLM to recognise
+        related domains.  The hash cannot be reversed without the
+        per-process key.
+
+
+        **Standalone domain handling** — bare FQDNs are replaced with
+        the same ``[DOMAIN_hash_N]`` format.
 
         URL regex excludes brackets so URLs containing already-replaced
-        placeholders (e.g. ``https://environments.local/path``) are NOT double-caught,
-        preventing vault-chaining bugs.
+        placeholders are NOT double-caught, preventing vault-chaining
+        bugs.
         """
-        if not self._config.get("urls", False):
+        if not self._config.get("urls", True):
             return text
 
         if "http" in text.lower():
@@ -1007,28 +1078,22 @@ class PromptSanitizer:
                         return url
 
                     # Never treat safe example/test domains as sensitive.
-                    # Check if hostname is exactly a safe domain OR ends with one
-                    # (e.g. "api.example.com" should also be safe).
                     hostname_lower = hostname.lower()
                     if any(
                         hostname_lower == safe or hostname_lower.endswith("." + safe)
                         for safe in _SAFE_URL_DOMAINS
                     ):
-                        # Safe domain (exact or subdomain) — pass through
-                        # unchanged. _domain_replace also checks safe domains,
-                        # so the second pass won't catch subdomains either.
                         return url
 
                     # Validate TLD against IANA list — skip redaction if the
-                    # TLD isn't a real top-level domain (prevents false
-                    # positives on fake/non-existent domains).
+                    # TLD isn't a real top-level domain.
                     last_dot = hostname_lower.rfind(".")
                     if last_dot == -1 or not _valid_tld(hostname_lower[last_dot + 1:]):
                         return url
 
-                    # Create or reuse a placeholder for this hostname.
-                    # Using the 'DOMAIN' category so standalone domains and
-                    # URL hostnames share the same placeholder namespace.
+                    # Create or reuse a hash-based placeholder for this
+                    # hostname.  Same SLD + different TLD produces same hash
+                    # prefix so the LLM can see domain relationships.
                     key = hostname.lower()
                     existing = self._reverse.get(key)
                     if existing:
@@ -1036,7 +1101,8 @@ class PromptSanitizer:
                         self._vault[existing]["last_used_at"] = time.time()
                     else:
                         self._counter += 1
-                        placeholder = f"[DOMAIN_{self._counter}]"
+                        sld_prefix = _sld_hash(hostname)
+                        placeholder = f"[DOMAIN_{sld_prefix}_{self._counter}]"
                         now = time.time()
                         self._vault[placeholder] = {
                             "value": key,
@@ -1059,8 +1125,6 @@ class PromptSanitizer:
                     new_netloc = netloc[:idx] + placeholder + netloc[idx + len(hostname):]
 
                     # Reconstruct the URL with the replaced netloc.
-                    # We rebuild from raw pieces to avoid urlunparse
-                    # re-encoding that could mangle the path/query.
                     scheme = parsed.scheme or "https"
                     return f"{scheme}://{new_netloc}{parsed.path or ''}" + (
                         f"?{parsed.query}" if parsed.query else ""
@@ -1074,7 +1138,7 @@ class PromptSanitizer:
 
         if "." in text:
             def _domain_replace(m):
-                """Replace a standalone domain match, validating the TLD first."""
+                """Replace a standalone domain match with hash-based placeholder."""
                 domain = m.group(0)
                 domain_lower = domain.lower()
 
@@ -1088,7 +1152,29 @@ class PromptSanitizer:
                 # Validate TLD against IANA list
                 last_dot = domain_lower.rfind(".")
                 if last_dot != -1 and _valid_tld(domain_lower[last_dot + 1:]):
-                    return self._sanitize_match(m, "DOMAIN")
+                    # Use same hash-based placeholder logic as URL handler
+                    key = domain_lower
+                    existing = self._reverse.get(key)
+                    if existing:
+                        self._vault[existing]["last_used_at"] = time.time()
+                        self._redaction_counts["DOMAIN"] = (
+                            self._redaction_counts.get("DOMAIN", 0) + 1
+                        )
+                        return existing
+                    self._counter += 1
+                    sld_prefix = _sld_hash(domain)
+                    placeholder = f"[DOMAIN_{sld_prefix}_{self._counter}]"
+                    now = time.time()
+                    self._vault[placeholder] = {
+                        "value": key,
+                        "created_at": now,
+                        "last_used_at": now,
+                    }
+                    self._reverse[key] = placeholder
+                    self._redaction_counts["DOMAIN"] = (
+                        self._redaction_counts.get("DOMAIN", 0) + 1
+                    )
+                    return placeholder
                 return domain
 
             text = _DOMAIN_RE.sub(_domain_replace, text)

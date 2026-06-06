@@ -113,9 +113,15 @@ s = PromptSanitizer({"enabled":True, "pii":True, "secrets":True,
                      "infrastructure":True, "urls":True})
 orig = "scan https://target.com/v1 and https://evil.com:443/path"
 sanitized = s.sanitize_text(orig)
-restored = s.restore_text(sanitized)
-check("URL round-trip", restored == orig,
+restored = s.restore_text(sanitized, lock_emoji=False)
+check("URL round-trip bare", restored == orig,
       f"orig={orig} san={sanitized} rest={restored}")
+# With emoji:
+restored_emoji = s.restore_text(sanitized, lock_emoji=True)
+check("URL round-trip emoji has arrow", "\u2192" in restored_emoji,
+      f"rest={restored_emoji}")
+check("URL round-trip emoji has lock", "\U0001f512" in restored_emoji,
+      f"rest={restored_emoji}")
 
 # --- Stable placeholder IDs ---
 print("\n--- Stable Placeholder IDs ---")
@@ -127,6 +133,26 @@ vault = s.get_vault()
 domains = [k for k in vault if k.startswith("[DOMAIN_")]
 check("Stable ID (same domain)", len(domains) == 1,
       f"domains={domains}")
+
+# --- Hash-based SLD similarity ---
+print("\n--- SLD Hash Similarity ---")
+s = PromptSanitizer({"enabled":True, "pii":True, "secrets":True,
+                     "infrastructure":True, "urls":True})
+s.sanitize_text("https://evilcorp.com/a")
+s.sanitize_text("https://evilcorp.io/b")
+vault = s.get_vault()
+dom_phs = sorted([k for k in vault if k.startswith("[DOMAIN_")])
+check("Two domains in vault", len(dom_phs) == 2, f"domains={dom_phs}")
+if len(dom_phs) == 2:
+    h1 = dom_phs[0].rsplit("_", 2)[1]
+    h2 = dom_phs[1].rsplit("_", 2)[1]
+    c1 = dom_phs[0].rsplit("_", 1)[1].rstrip("]")
+    c2 = dom_phs[1].rsplit("_", 1)[1].rstrip("]")
+    check("Same SLD same hash prefix", h1 == h2, f"{h1} vs {h2}")
+    check("Different counters", c1 != c2, f"{c1} vs {c2}")
+    check("Both values correct", 
+          "evilcorp.com" in str(vault) and "evilcorp.io" in str(vault),
+          str(vault))
 
 print()
 print("=" * 60)
